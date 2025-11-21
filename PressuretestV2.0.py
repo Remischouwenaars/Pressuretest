@@ -1,4 +1,4 @@
-# PressuretestV3.1.py
+# PressuretestV3.4.py
 import os, hashlib
 from io import BytesIO
 from datetime import datetime, date, time, timedelta
@@ -13,14 +13,25 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image as RLImage
 
 # ======================
+# PATHS (logo t.o.v. dit script)
+# ======================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(BASE_DIR, "assets", "logo.png")
+
+# ======================
 # TRANSLATIONS
 # ======================
 T = {
     "nl": {
         "title":"Druktest rapport","language":"Taal","project_info":"Projectgegevens",
-        "project_name":"Projectnaam","manufacturer":"Fabrikant","work_order":"Werkorder / Inkooporder",
+        "project_name":"Projectnaam","manufacturer":"Fabrikant",
+        "work_order":"WO of PO + volgnummer / serienummer",
         "drawing":"Tekening","revision":"Revisie","part_line":"Onderdeelnaam / Lijnsectie",
         "requirements":"Test requirements","pt":"Testdruk (Pt)","pt_unit":"Eenheid","notes":"Opmerkingen",
+
+        # Nieuwe velden onder Test requirements
+        "test_instrument":"Testinstrument",
+        "calibration_date":"Kalibratiedatum",
 
         # Per compartiment timing (geen overall timing meer)
         "comp_duration":"Testduur compartiment",
@@ -43,9 +54,14 @@ T = {
     },
     "en": {
         "title":"Pressure test report","language":"Language","project_info":"Project information",
-        "project_name":"Project name","manufacturer":"Manufacturer","work_order":"Work order / Purchase order",
+        "project_name":"Project name","manufacturer":"Manufacturer",
+        "work_order":"WO or PO + serial / serial number",
         "drawing":"Drawing","revision":"Revision","part_line":"Part name / Line section",
         "requirements":"Test requirements","pt":"Test pressure (Pt)","pt_unit":"Unit","notes":"Remarks",
+
+        # New fields under Test requirements
+        "test_instrument":"Test instrument",
+        "calibration_date":"Calibration date",
 
         "comp_duration":"Compartment test duration",
 
@@ -74,7 +90,6 @@ PSI_PER_BAR = 14.5037738
 def bar_to_psi(v): return None if v is None else v * PSI_PER_BAR
 def psi_to_bar(v): return None if v is None else v / PSI_PER_BAR
 def fmt_duration(td, lang):
-    # td is a timedelta
     total_min = int(round(td.total_seconds() / 60.0))
     h, m = divmod(total_min, 60)
     return f"{h} uur {m} min" if lang=="nl" else f"{h} h {m} min"
@@ -98,19 +113,18 @@ def canvas_to_pil(canvas_image_data):
     return PILImage.fromarray(canvas_image_data.astype("uint8")).convert("RGB")
 
 def _pil_to_rlimage(pil_img, max_w_px=420):
-    """Scale PIL image to fit within max_w_px; keep aspect; return ReportLab RLImage."""
     w,h = pil_img.size
     scale = min(max_w_px / float(w), 1.0)
     if scale < 1.0:
         pil_img = pil_img.resize((int(w*scale), int(h*scale)))
     bio = BytesIO(); pil_img.save(bio, format="PNG"); bio.seek(0)
-    # width/height are in pixels; ReportLab will map using dpi ~72; passing explicit width/height keeps pixel dims
     return RLImage(bio, width=pil_img.size[0], height=pil_img.size[1])
 
 # ======================
 # PDF BUILDER (always English)
 # ======================
 def build_pdf_bytes(data, logo_path=None):
+    # logo_path niet meer gebruikt; geen logo in PDF
     L = "en"
     buf = BytesIO()
     doc = SimpleDocTemplate(
@@ -120,9 +134,7 @@ def build_pdf_bytes(data, logo_path=None):
     styles = getSampleStyleSheet()
     story = []
 
-    # Header
-    if logo_path and os.path.exists(logo_path):
-        story += [RLImage(logo_path, width=120, height=40), Spacer(1, 6)]
+    # Titel
     story += [Paragraph(f"<b>{T[L]['title']}</b>", styles["Title"]), Spacer(1, 10)]
 
     # Meta
@@ -148,8 +160,14 @@ def build_pdf_bytes(data, logo_path=None):
     req = data["requirements"]
     pt_bar = req["pt_value"] if req["pt_unit"]=="bar" else psi_to_bar(req["pt_value"])
     pt_psi = req["pt_value"] if req["pt_unit"]=="psi" else bar_to_psi(req["pt_value"])
+
+    test_instrument = req.get("test_instrument", "")
+    calibration_date_str = req.get("calibration_date_str", "")
+
     req_rows = [
         [T[L]["pt"], f"{pt_bar:.2f} {T[L]['unit_bar_g']} / {pt_psi:.2f} {T[L]['unit_psi_g']}"],
+        [T[L]["test_instrument"], test_instrument],
+        [T[L]["calibration_date"], calibration_date_str],
         [T[L]["notes"], req["notes"]],
     ]
     req_tbl = Table(req_rows, colWidths=[200, 320])
@@ -186,15 +204,15 @@ def build_pdf_bytes(data, logo_path=None):
         ("BACKGROUND",(0,0),(-1,0),colors.lightgrey),
         ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
     ]))
-    story += [Paragraph("<b>Registration test equipment</b>", styles["Heading3"]), tbl, Spacer(1, 10)]
+    story += [Paragraph("<b>Test registration</b>", styles["Heading3"]), tbl, Spacer(1, 10)]
 
-    # Photos per compartment: Start (caption) then End (caption + duration)
+    # Photos per compartment
     story += [Paragraph("<b>Photos per compartment</b>", styles["Heading3"]), Spacer(1, 6)]
     for i, c in enumerate(comps):
         story += [Paragraph(f"<b>Compartment {i+1}</b>", styles["Heading4"])]
         for tp in ["start","end"]:
             photo = c["photos"].get(tp)
-            if not photo: 
+            if not photo:
                 continue
             story += [
                 _pil_to_rlimage(photo["img"], max_w_px=420),
@@ -206,7 +224,6 @@ def build_pdf_bytes(data, logo_path=None):
                 Spacer(1, 6)
             ]
             if tp == "end":
-                # Show compartment test duration in bold, if start ts exists
                 start_ph = c["photos"].get("start")
                 if start_ph:
                     dur = photo["ts"] - start_ph["ts"]
@@ -236,7 +253,6 @@ def build_pdf_bytes(data, logo_path=None):
 # ======================
 st.set_page_config(page_title="Druktest rapport", page_icon="🧪", layout="centered")
 
-# Branding (optioneel, eenvoudig)
 st.markdown("""
 <style>
   .stApp { background-color: #F18500; }
@@ -245,15 +261,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # State init
-if "comp_count" not in st.session_state: st.session_state.comp_count = 1
-if "comp_data" not in st.session_state: st.session_state.comp_data = [{"photos":{"start":None,"end":None}} for _ in range(st.session_state.comp_count)]
-# Single camera target: {"idx": int, "slot": "start"|"end"} or None
-if "camera_target" not in st.session_state: st.session_state.camera_target = None
+if "comp_count" not in st.session_state:
+    st.session_state.comp_count = 1
+if "comp_data" not in st.session_state:
+    st.session_state.comp_data = [{"photos":{"start":None,"end":None}} for _ in range(st.session_state.comp_count)]
+if "camera_target" not in st.session_state:
+    st.session_state.camera_target = None  # {"idx": int, "slot": "start"|"end"} or None
 
 # Language
 lang = st.sidebar.selectbox("Language / Taal", ["nl","en"], index=0)
 _ = T[lang]
-st.title(_["title"])
+
+# ===== LOGO + TITEL BOVENAAN =====
+top_logo_col, top_title_col = st.columns([1, 4])
+with top_logo_col:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=120)
+with top_title_col:
+    st.title(_["title"])
 
 # META
 st.subheader(_["project_info"])
@@ -269,7 +294,13 @@ part_line = st.text_input(_["part_line"], "")
 st.markdown(f"### {_['requirements']}")
 r1,r2 = st.columns(2)
 pt_value = r1.number_input(_["pt"], min_value=0.0, step=0.1, format="%.2f")
-pt_unit_choice = r2.selectbox(_["pt_unit"], ["bar","psi"], index=0, format_func=lambda x: _["unit_bar_g"] if x=="bar" else _["unit_psi_g"])
+pt_unit_choice = r2.selectbox(_["pt_unit"], ["bar","psi"], index=0,
+                              format_func=lambda x: _["unit_bar_g"] if x=="bar" else _["unit_psi_g"])
+
+r3, r4 = st.columns(2)
+test_instrument = r3.text_input(_["test_instrument"], "")
+calibration_date = r4.date_input(_["calibration_date"], value=date.today())
+
 notes = st.text_area(_["notes"], "")
 
 # COMPARTMENTS (counts)
@@ -279,7 +310,6 @@ if comp_count != st.session_state.comp_count:
     st.session_state.comp_count = comp_count
     st.session_state.comp_data = [{"photos":{"start":None,"end":None}} for _ in range(comp_count)]
 
-# Per compartment inputs (pressures/times/results) + photos
 labels = [_["date"],_["start_time"],_["start_pressure"],_["end_time"],_["end_pressure"],_["result"],_["remarks"]]
 comps = []
 for i in range(st.session_state.comp_count):
@@ -288,19 +318,21 @@ for i in range(st.session_state.comp_count):
         cd = cA.date_input(labels[0], value=date.today(), key=f"c{i}_date")
         cst = cA.time_input(labels[1], value=time(9,0), key=f"c{i}_st")
         cet = cA.time_input(labels[3], value=time(10,0), key=f"c{i}_et")
-        csp = cB.number_input(labels[2] + f" ({_['unit_bar_g']})", min_value=0.0, step=0.1, format="%.2f", key=f"c{i}_sp")
-        cep = cB.number_input(labels[4] + f" ({_['unit_bar_g']})", min_value=0.0, step=0.1, format="%.2f", key=f"c{i}_ep")
-        res = st.radio(labels[5], options=["", _["pass"], _["fail"]], index=0, horizontal=True, key=f"c{i}_res")
+        csp = cB.number_input(labels[2] + f" ({_['unit_bar_g']})", min_value=0.0, step=0.1,
+                              format="%.2f", key=f"c{i}_sp")
+        cep = cB.number_input(labels[4] + f" ({_['unit_bar_g']})", min_value=0.0, step=0.1,
+                              format="%.2f", key=f"c{i}_ep")
+        res = st.radio(labels[5], options=["", _["pass"], _["fail"]],
+                       index=0, horizontal=True, key=f"c{i}_res")
         rem = st.text_input(labels[6], "", key=f"c{i}_rem")
 
-        # --- Photos per slot (Start / End) ---
         for slot in ["start","end"]:
             st.markdown(f"**{_['compartments']} {i+1} – {_[slot+'_photo']}**")
 
-            # Buttons: choose this slot for the single camera, or upload file
             bcol1, bcol2 = st.columns([1,1])
             with bcol1:
-                if st.button(f"{_['use_camera']} ({_['slot_start'] if slot=='start' else _['slot_end']})", key=f"c{i}_{slot}_usecam"):
+                if st.button(f"{_['use_camera']} ({_['slot_start'] if slot=='start' else _['slot_end']})",
+                             key=f"c{i}_{slot}_usecam"):
                     st.session_state.camera_target = {"idx": i, "slot": slot}
             with bcol2:
                 up = st.file_uploader("", type=["png","jpg","jpeg"], key=f"c{i}_{slot}_up")
@@ -313,42 +345,52 @@ for i in range(st.session_state.comp_count):
                         ts = datetime.now().replace(second=0, microsecond=0)
                         no_exif = True
                         st.warning(_["exif_missing"])
-                    st.session_state.comp_data[i]["photos"][slot] = {"img": img, "ts": ts, "no_exif": no_exif}
+                    st.session_state.comp_data[i]["photos"][slot] = {
+                        "img": img, "ts": ts, "no_exif": no_exif
+                    }
 
-            # Single preview (with timestamp)
             photo = st.session_state.comp_data[i]["photos"][slot]
             if photo:
                 st.image(
                     photo["img"],
-                    caption=f"{_['timestamp']}: {photo['ts'].strftime('%Y-%m-%d %H:%M')}" + ("  ⚠" if photo.get("no_exif") else ""),
+                    caption=f"{_['timestamp']}: {photo['ts'].strftime('%Y-%m-%d %H:%M')}"
+                            + ("  ⚠" if photo.get("no_exif") else ""),
                     use_container_width=True
                 )
 
-        # Append comp data
         comps.append({
             "date": cd, "date_str": cd.strftime("%Y-%m-%d"),
             "start_time": cst, "start_time_str": cst.strftime("%H:%M"),
             "end_time": cet, "end_time_str": cet.strftime("%H:%M"),
-            "start_bar": float(csp) if csp is not None else None, "start_psi": bar_to_psi(float(csp) if csp is not None else None),
-            "end_bar": float(cep) if cep is not None else None, "end_psi": bar_to_psi(float(cep) if cep is not None else None),
+            "start_bar": float(csp) if csp is not None else None,
+            "start_psi": bar_to_psi(float(csp) if csp is not None else None),
+            "end_bar": float(cep) if cep is not None else None,
+            "end_psi": bar_to_psi(float(cep) if cep is not None else None),
             "result": res, "remarks": rem,
             "photos": st.session_state.comp_data[i]["photos"]
         })
 
-# --- SINGLE CAMERA (one stream only) ---
+# SINGLE CAMERA
 st.divider()
 cam_hdr = st.columns([1,2,2])
-cam_hdr[0].write(f"🎥 {_[ 'use_camera' ]}")
+cam_hdr[0].write(f"🎥 {_['use_camera']}")
 target = st.session_state.camera_target
-cam_hdr[1].write(f"{_['selected_target']}: " + (f"{_['compartments']} {target['idx']+1} – {_[ 'slot_start' if target and target.get('slot')=='start' else 'slot_end' ]}" if target else _['selected_none']))
+cam_hdr[1].write(
+    f"{_['selected_target']}: " + (
+        f"{_['compartments']} {target['idx']+1} – "
+        f"{_['slot_start' if target and target.get('slot')=='start' else 'slot_end']}"
+        if target else _['selected_none']
+    )
+)
 
-# Only show camera if a target is selected
 if target:
     cam = st.camera_input("")
     if cam is not None:
         img = bytes_to_pil(cam.getvalue())
         ts = datetime.now().replace(second=0, microsecond=0)
-        st.session_state.comp_data[target["idx"]]["photos"][target["slot"]] = {"img": img, "ts": ts, "no_exif": False}
+        st.session_state.comp_data[target["idx"]]["photos"][target["slot"]] = {
+            "img": img, "ts": ts, "no_exif": False
+        }
         st.session_state.camera_target = None
         st.success("Photo captured and assigned.")
 
@@ -379,17 +421,30 @@ if reset:
 
 # VALIDATION & PDF
 def _meta_ok():
-    return all([project_name.strip(), manufacturer.strip(), work_order.strip(), drawing.strip(), revision.strip(), part_line.strip()])
+    return all([
+        project_name.strip(),
+        manufacturer.strip(),
+        work_order.strip(),
+        drawing.strip(),
+        revision.strip(),
+        part_line.strip()
+    ])
+
 def _req_ok():
-    return pt_value is not None and pt_value > 0.0 and pt_unit_choice in ("bar","psi")
+    return (
+        pt_value is not None and pt_value > 0.0 and pt_unit_choice in ("bar","psi")
+        and test_instrument.strip()
+        and calibration_date is not None
+    )
+
 def _comps_ok():
-    for i,c in enumerate(comps):
-        # require pressures and result + both photos
+    for c in comps:
         if (c["start_bar"] is None) or (c["end_bar"] is None) or (c["result"] not in (_["pass"], _["fail"])):
             return False
         if not (c["photos"].get("start") and c["photos"].get("end")):
             return False
     return True
+
 def _sig_ok():
     return bool(sign_name.strip()) and bool(sign_company.strip()) and bool(sign_date) and (sig_img is not None)
 
@@ -405,13 +460,32 @@ if gen:
         st.error(_["need_all"])
         st.info("Missing: " + ", ".join(missing))
     else:
-        meta = {"project_name":project_name,"manufacturer":manufacturer,"work_order":work_order,"drawing":drawing,"revision":revision,"part_line":part_line}
-        req = {"pt_value":float(pt_value),"pt_unit":pt_unit_choice,"notes":notes}
-        signature = {"name":sign_name,"company":sign_company,"date":sign_date,"date_str":sign_date.strftime("%Y-%m-%d"),"image_pil":sig_img}
+        meta = {
+            "project_name": project_name,
+            "manufacturer": manufacturer,
+            "work_order": work_order,
+            "drawing": drawing,
+            "revision": revision,
+            "part_line": part_line
+        }
+        req = {
+            "pt_value": float(pt_value),
+            "pt_unit": pt_unit_choice,
+            "notes": notes,
+            "test_instrument": test_instrument,
+            "calibration_date": calibration_date,
+            "calibration_date_str": calibration_date.strftime("%Y-%m-%d") if calibration_date else ""
+        }
+        signature = {
+            "name": sign_name,
+            "company": sign_company,
+            "date": sign_date,
+            "date_str": sign_date.strftime("%Y-%m-%d"),
+            "image_pil": sig_img
+        }
 
-        pdf_data = {"meta":meta,"requirements":req,"compartments":comps,"signature":signature}
-        logo_path = os.path.join("assets","logo.png") if os.path.exists(os.path.join("assets","logo.png")) else None
-        pdf_bytes = build_pdf_bytes(pdf_data, logo_path=logo_path)
+        pdf_data = {"meta": meta, "requirements": req, "compartments": comps, "signature": signature}
+        pdf_bytes = build_pdf_bytes(pdf_data, logo_path=None)
         st.success(_["success_pdf"])
 
 if pdf_bytes:
