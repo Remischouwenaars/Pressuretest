@@ -1,7 +1,8 @@
-# PressuretestV3.4.py
-import os, hashlib
+# PressuretestV3.10.py
+import os
 from io import BytesIO
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time
+import urllib.parse
 
 import streamlit as st
 from PIL import Image as PILImage, ExifTags
@@ -33,7 +34,7 @@ T = {
         "test_instrument":"Testinstrument",
         "calibration_date":"Kalibratiedatum",
 
-        # Per compartiment timing (geen overall timing meer)
+        # Per compartiment timing
         "comp_duration":"Testduur compartiment",
 
         "equip":"Registratie testapparatuur","compartments":"Compartiment / sectie","num_comp":"Aantal compartimenten",
@@ -50,7 +51,16 @@ T = {
         "actions":"Acties","gen_pdf":"Genereer PDF","dl_pdf":"Download PDF","reset":"Formulier leegmaken",
         "success_pdf":"PDF is gegenereerd.","need_all":"Vul alle verplichte velden in.",
 
-        "unit_bar_g":"bar(g)","unit_psi_g":"PSI(g)"
+        "unit_bar_g":"bar(g)","unit_psi_g":"PSI(g)",
+
+        # Email UI
+        "email_section":"E-mail voorbereiden",
+        "email_to_doc_label":"Stuur naar documentation@tanis.com",
+        "email_extra_to":"Extra ontvanger (optioneel)",
+        "email_subject":"Onderwerp",
+        "email_body":"Bericht",
+        "email_open_btn":"📧 Open e-mail in Outlook / mail-app",
+        "email_no_recipient":"Geen ontvanger geselecteerd. Vink documentation@tanis.com aan of vul een extra ontvanger in."
     },
     "en": {
         "title":"Pressure test report","language":"Language","project_info":"Project information",
@@ -79,7 +89,16 @@ T = {
         "actions":"Actions","gen_pdf":"Generate PDF","dl_pdf":"Download PDF","reset":"Clear form",
         "success_pdf":"PDF generated.","need_all":"Please complete all required fields.",
 
-        "unit_bar_g":"bar(g)","unit_psi_g":"PSI(g)"
+        "unit_bar_g":"bar(g)","unit_psi_g":"PSI(g)",
+
+        # Email UI
+        "email_section":"Prepare e-mail",
+        "email_to_doc_label":"Send to documentation@tanis.com",
+        "email_extra_to":"Additional recipient (optional)",
+        "email_subject":"Subject",
+        "email_body":"Message",
+        "email_open_btn":"📧 Open e-mail in Outlook / mail app",
+        "email_no_recipient":"No recipient selected. Check documentation@tanis.com or fill an additional recipient."
     }
 }
 
@@ -89,6 +108,7 @@ T = {
 PSI_PER_BAR = 14.5037738
 def bar_to_psi(v): return None if v is None else v * PSI_PER_BAR
 def psi_to_bar(v): return None if v is None else v / PSI_PER_BAR
+
 def fmt_duration(td, lang):
     total_min = int(round(td.total_seconds() / 60.0))
     h, m = divmod(total_min, 60)
@@ -97,34 +117,61 @@ def fmt_duration(td, lang):
 def exif_datetime(img: PILImage.Image):
     try:
         exif = img.getexif()
-        if not exif: return None
-        tags = {ExifTags.TAGS.get(k,k):v for k,v in exif.items()}
+        if not exif:
+            return None
+        tags = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
         s = tags.get("DateTimeOriginal") or tags.get("DateTime")
-        if not s: return None
+        if not s:
+            return None
         s = s.replace(":", "-", 2)
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
 
-def bytes_to_pil(b): return None if not b else PILImage.open(BytesIO(b)).convert("RGB")
+def bytes_to_pil(b):
+    return None if not b else PILImage.open(BytesIO(b)).convert("RGB")
+
 def canvas_to_pil(canvas_image_data):
-    if canvas_image_data is None: return None
+    if canvas_image_data is None:
+        return None
     import numpy as np
     return PILImage.fromarray(canvas_image_data.astype("uint8")).convert("RGB")
 
-def _pil_to_rlimage(pil_img, max_w_px=420):
-    w,h = pil_img.size
-    scale = min(max_w_px / float(w), 1.0)
-    if scale < 1.0:
-        pil_img = pil_img.resize((int(w*scale), int(h*scale)))
-    bio = BytesIO(); pil_img.save(bio, format="PNG"); bio.seek(0)
-    return RLImage(bio, width=pil_img.size[0], height=pil_img.size[1])
+def _pil_to_rlimage(pil_img, max_w_px=400, aspect_ratio=(16, 9)):
+    """
+    Schaal afbeelding zodat deze netjes in de breedte past en in een vaste ratio wordt weergegeven.
+    Default: 16:9 en max 400 breed -> past mooi op A4 met ruimte voor tekst.
+    """
+    target_w = max_w_px
+    target_h = int(max_w_px * aspect_ratio[1] / aspect_ratio[0])  # bij 16:9 = 225px hoog bij 400px breed
+
+    w, h = pil_img.size
+    scale = target_w / float(w)
+    new_w = target_w
+    new_h = int(h * scale)
+
+    pil_img_resized = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
+
+    if new_h > target_h:
+        # Te hoog: centraal croppen naar target_h
+        offset = (new_h - target_h) // 2
+        pil_img_cropped = pil_img_resized.crop((0, offset, new_w, offset + target_h))
+    else:
+        # Te laag: witte balken boven/onder (letterbox)
+        pad = PILImage.new("RGB", (new_w, target_h), "white")
+        top = (target_h - new_h) // 2
+        pad.paste(pil_img_resized, (0, top))
+        pil_img_cropped = pad
+
+    bio = BytesIO()
+    pil_img_cropped.save(bio, format="PNG")
+    bio.seek(0)
+    return RLImage(bio, width=new_w, height=target_h)
 
 # ======================
-# PDF BUILDER (always English)
+# PDF BUILDER (altijd Engels)
 # ======================
 def build_pdf_bytes(data, logo_path=None):
-    # logo_path niet meer gebruikt; geen logo in PDF
     L = "en"
     buf = BytesIO()
     doc = SimpleDocTemplate(
@@ -179,7 +226,7 @@ def build_pdf_bytes(data, logo_path=None):
     ]))
     story += [Paragraph("<b>Test requirements</b>", styles["Heading3"]), req_tbl, Spacer(1, 10)]
 
-    # Registration table (pressures/results/remarks)
+    # Registration table
     comps = data["compartments"]
     n = len(comps)
     header = [""] + [str(i+1) for i in range(n)]
@@ -215,7 +262,7 @@ def build_pdf_bytes(data, logo_path=None):
             if not photo:
                 continue
             story += [
-                _pil_to_rlimage(photo["img"], max_w_px=420),
+                _pil_to_rlimage(photo["img"], max_w_px=400, aspect_ratio=(16,9)),
                 Paragraph(
                     f"{tp.capitalize()} time: {photo['ts'].strftime('%Y-%m-%d %H:%M')}"
                     + (f" – {T[L]['exif_missing']}" if photo.get("no_exif") else ""),
@@ -234,7 +281,8 @@ def build_pdf_bytes(data, logo_path=None):
     sig = data["signature"]
     story += [Paragraph("<b>Signature</b>", styles["Heading3"])]
     if sig.get("image_pil"):
-        story += [_pil_to_rlimage(sig["image_pil"], max_w_px=600), Spacer(1, 6)]
+        # Handtekening iets breder, platter (4:1)
+        story += [_pil_to_rlimage(sig["image_pil"], max_w_px=320, aspect_ratio=(4,1)), Spacer(1, 6)]
     sig_rows = [["Name", sig["name"]], ["Company", sig["company"]], ["Date", sig["date_str"]]]
     sig_tbl = Table(sig_rows, colWidths=[160, 360])
     sig_tbl.setStyle(TableStyle([
@@ -266,7 +314,7 @@ if "comp_count" not in st.session_state:
 if "comp_data" not in st.session_state:
     st.session_state.comp_data = [{"photos":{"start":None,"end":None}} for _ in range(st.session_state.comp_count)]
 if "camera_target" not in st.session_state:
-    st.session_state.camera_target = None  # {"idx": int, "slot": "start"|"end"} or None
+    st.session_state.camera_target = None  # {"idx": int, "slot": "start"|"end"} of None
 
 # Language
 lang = st.sidebar.selectbox("Language / Taal", ["nl","en"], index=0)
@@ -282,7 +330,7 @@ with top_title_col:
 
 # META
 st.subheader(_["project_info"])
-m1,m2 = st.columns(2)
+m1, m2 = st.columns(2)
 project_name = m1.text_input(_["project_name"], "")
 manufacturer = m2.text_input(_["manufacturer"], "")
 work_order = st.text_input(_["work_order"], "")
@@ -292,10 +340,12 @@ part_line = st.text_input(_["part_line"], "")
 
 # REQUIREMENTS
 st.markdown(f"### {_['requirements']}")
-r1,r2 = st.columns(2)
+r1, r2 = st.columns(2)
 pt_value = r1.number_input(_["pt"], min_value=0.0, step=0.1, format="%.2f")
-pt_unit_choice = r2.selectbox(_["pt_unit"], ["bar","psi"], index=0,
-                              format_func=lambda x: _["unit_bar_g"] if x=="bar" else _["unit_psi_g"])
+pt_unit_choice = r2.selectbox(
+    _["pt_unit"], ["bar","psi"], index=0,
+    format_func=lambda x: _["unit_bar_g"] if x=="bar" else _["unit_psi_g"]
+)
 
 r3, r4 = st.columns(2)
 test_instrument = r3.text_input(_["test_instrument"], "")
@@ -314,21 +364,20 @@ labels = [_["date"],_["start_time"],_["start_pressure"],_["end_time"],_["end_pre
 comps = []
 for i in range(st.session_state.comp_count):
     with st.expander(f"{_['compartments']} {i+1}", expanded=True):
-        cA,cB = st.columns(2)
+        cA, cB = st.columns(2)
         cd = cA.date_input(labels[0], value=date.today(), key=f"c{i}_date")
         cst = cA.time_input(labels[1], value=time(9,0), key=f"c{i}_st")
         cet = cA.time_input(labels[3], value=time(10,0), key=f"c{i}_et")
-        csp = cB.number_input(labels[2] + f" ({_['unit_bar_g']})", min_value=0.0, step=0.1,
-                              format="%.2f", key=f"c{i}_sp")
-        cep = cB.number_input(labels[4] + f" ({_['unit_bar_g']})", min_value=0.0, step=0.1,
-                              format="%.2f", key=f"c{i}_ep")
+        csp = cB.number_input(labels[2] + f" ({_['unit_bar_g']})",
+                              min_value=0.0, step=0.1, format="%.2f", key=f"c{i}_sp")
+        cep = cB.number_input(labels[4] + f" ({_['unit_bar_g']})",
+                              min_value=0.0, step=0.1, format="%.2f", key=f"c{i}_ep")
         res = st.radio(labels[5], options=["", _["pass"], _["fail"]],
                        index=0, horizontal=True, key=f"c{i}_res")
         rem = st.text_input(labels[6], "", key=f"c{i}_rem")
 
         for slot in ["start","end"]:
             st.markdown(f"**{_['compartments']} {i+1} – {_[slot+'_photo']}**")
-
             bcol1, bcol2 = st.columns([1,1])
             with bcol1:
                 if st.button(f"{_['use_camera']} ({_['slot_start'] if slot=='start' else _['slot_end']})",
@@ -340,7 +389,8 @@ for i in range(st.session_state.comp_count):
                     img = bytes_to_pil(up.getvalue())
                     dt = exif_datetime(img)
                     if dt:
-                        ts = dt; no_exif = False
+                        ts = dt
+                        no_exif = False
                     else:
                         ts = datetime.now().replace(second=0, microsecond=0)
                         no_exif = True
@@ -412,7 +462,7 @@ with sg2:
 
 # ACTIONS
 st.markdown(f"### {_['actions']}")
-b1,b2 = st.columns(2)
+b1, b2 = st.columns(2)
 gen = b1.button(_["gen_pdf"], type="primary")
 reset = b2.button(_["reset"])
 if reset:
@@ -491,3 +541,36 @@ if gen:
 if pdf_bytes:
     fname = f"{datetime.now().strftime('%Y-%m-%d')}_{(project_name or 'Project').replace(' ','_')}_Report.pdf"
     st.download_button(_["dl_pdf"], data=pdf_bytes, file_name=fname, mime="application/pdf")
+
+    # ===== E-MAIL VOORBEREIDEN (mailto) =====
+    st.markdown(f"### {_['email_section']}")
+
+    send_to_doc = st.checkbox(_["email_to_doc_label"], value=True)
+    extra_recipient = st.text_input(_["email_extra_to"], key="email_extra_to")
+
+    if lang == "nl":
+        default_subject = f"Druktestrapport - {project_name or ''}".strip(" -")
+        default_body = "Beste ontvanger,\n\nIn de bijlage vindt u het druktestrapport.\n\nMet vriendelijke groet,\n"
+    else:
+        default_subject = f"Pressure test report - {project_name or ''}".strip(" -")
+        default_body = "Dear recipient,\n\nPlease find the attached pressure test report.\n\nKind regards,\n"
+
+    subject = st.text_input(_["email_subject"], value=default_subject or _["title"])
+    body = st.text_area(_["email_body"], value=default_body, height=150)
+
+    recipients = []
+    if send_to_doc:
+        recipients.append("documentation@tanis.com")
+    if extra_recipient.strip():
+        recipients.append(extra_recipient.strip())
+
+    if recipients:
+        to_str = ",".join(recipients)
+        subject_enc = urllib.parse.quote(subject)
+        body_enc = urllib.parse.quote(body)
+        mailto_url = f"mailto:{to_str}?subject={subject_enc}&body={body_enc}"
+
+        st.markdown(f"[{_['email_open_btn']}]({mailto_url})")
+        st.caption("Na openen nog even de PDF handmatig als bijlage toevoegen.")
+    else:
+        st.info(_["email_no_recipient"])
