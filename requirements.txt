@@ -3,3 +3,4 @@ Pillow
 streamlit-drawable-canvas
 reportlab
 numpy
+streamlit-back-camera-input
